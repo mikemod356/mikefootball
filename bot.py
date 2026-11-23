@@ -25,7 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- Persistent user store ----------
-# Simple JSON file store (for Railway volume). For scale, use Redis/DB.
 DATA_FILE = Path("users.json")
 
 def load_users():
@@ -216,6 +215,7 @@ async def team_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user["league"] = league
     user["team"] = team_name
     user["team_slug"] = slug
+    user["last_urls"] = []  # reset dedupe history when team changes
     save_user(q.from_user.id, user)
 
     articles = await fetch_team_news(slug, limit=3)
@@ -231,7 +231,7 @@ async def team_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         body, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True
     )
 
-# ---------- Background job: 15-minute updates ----------
+# ---------- Background job: 15-minute updates (with dedupe) ----------
 async def send_team_updates(ctx: ContextTypes.DEFAULT_TYPE):
     for uid_str, data in list(USERS.items()):
         slug = data.get("team_slug")
@@ -239,22 +239,41 @@ async def send_team_updates(ctx: ContextTypes.DEFAULT_TYPE):
         if not slug or not team:
             continue
         try:
-            articles = await fetch_team_news(slug, limit=2)
+            articles = await fetch_team_news(slug, limit=5)
             if not articles:
                 continue
-            msg = format_news(articles, f"⏰ *{team}* — Update")
+
+            sent_before = set(data.get("last_urls", []))
+            new_articles = [a for a in articles if a["url"] not in sent_before]
+            if not new_articles:
+                continue
+
+            new_articles = new_articles[:2]
+            msg = format_news(new_articles, f"⏰ *{team}* — Update")
             msg += "\n\n🔗 Read more: https://tribuna.com/"
             await ctx.bot.send_message(
                 int(uid_str), msg, parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
+
+            # remember the last 20 URLs sent for this user
+            updated = list(sent_before.union({a["url"] for a in new_articles}))[-20:]
+            data["last_urls"] = updated
+            save_user(int(uid_str), data)
+
         except Exception as e:
             logger.warning(f"update failed for {uid_str}: {e}")
         await asyncio.sleep(0.5)  # be gentle to tribuna
 
 async def post_init(app: Application):
-    # schedule every 15 minutes
+    if app.job_queue is None:
+        logger.error(
+            "JobQueue is not available. Install with: "
+            "pip install 'python-telegram-bot[job-queue]'"
+        )
+        return
     app.job_queue.run_repeating(send_team_updates, interval=900, first=60)
+    logger.info("15-minute team update job scheduled.")
 
 def main():
     if not BOT_TOKEN:
